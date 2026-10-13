@@ -806,6 +806,13 @@ function wrapStreamWithErrorHandler(
               }
 
               if (error instanceof InStreamCompactionRequired) {
+                // Wrap only to contain context errors from the summary (so
+                // they route through the recovery cascade). Idle/rate-limit
+                // resume is the inner resumed stream's job — it owns the
+                // post-summary container. Max out both counters here so this
+                // outer layer never re-dispatches `messagesContainer.current`,
+                // which still holds the pre-summary oversized history and
+                // would undo the compaction we just performed.
                 const summarizationStream = wrapStreamWithErrorHandler(
                   createSummarizationStream(
                     error.messages,
@@ -816,6 +823,8 @@ function wrapStreamWithErrorHandler(
                   opts,
                   model,
                   silent,
+                  MAX_RATE_LIMIT_RETRIES,
+                  MAX_IDLE_RESUME_RETRIES,
                 );
                 for await (const chunk of summarizationStream.fullStream) {
                   yield chunk;
