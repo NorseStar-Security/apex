@@ -82,6 +82,7 @@ import {
   createSummarizationStream,
   getProviderModel,
   isAnthropicProvider,
+  SummarizationRejectedError,
 } from "./utils";
 
 const log = scopedLogger(() => createLogger("ai"));
@@ -826,6 +827,7 @@ function wrapStreamWithErrorHandler(
               // as-is; the prompt must be reduced via summarization.
               const isCtxError =
                 error instanceof InStreamCompactionRequired ||
+                error instanceof SummarizationRejectedError ||
                 checkIfContextLengthError(error);
 
               // A latched persistence failure is terminal: retrying would
@@ -992,7 +994,12 @@ function wrapStreamWithErrorHandler(
                 // `MAX_RESTART_DEPTH` finally trips.
                 let postReactiveDepth = opts._restartDepth ?? 0;
 
-                if (fitted.fitsBudget && fitted.modified) {
+                // A rejected summary never dispatched the fitted history to
+                // the provider, so an unmodified fit is still worth sending —
+                // only re-summarizing is pointless.
+                const summaryRejected =
+                  error instanceof SummarizationRejectedError;
+                if (fitted.fitsBudget && (fitted.modified || summaryRejected)) {
                   if (!silent) {
                     log.warn(
                       `Context length error — Layer 1+2 reduced to ~${fitted.estimatedInputTokens} tokens, retrying`,
@@ -1012,6 +1019,9 @@ function wrapStreamWithErrorHandler(
                       ...opts,
                       messages: fitted.messages,
                       _restartDepth: postReactiveDepth + 1,
+                      ...(summaryRejected
+                        ? { _skipProactiveSummarization: true }
+                        : {}),
                     });
                     const wrappedRetry = wrapStreamWithErrorHandler(
                       retried,
@@ -1094,9 +1104,37 @@ function wrapStreamWithErrorHandler(
                     (summarizeError instanceof Error &&
                       summarizeError.name === "AbortError") ||
                     opts.abortSignal?.aborted ||
-                    !checkIfContextLengthError(summarizeError)
+                    !(
+                      checkIfContextLengthError(summarizeError) ||
+                      summarizeError instanceof SummarizationRejectedError
+                    )
                   ) {
                     throw summarizeError;
+                  }
+                  // Proactive in-stream compaction fires while the history
+                  // still fits the provider window — the summary was an
+                  // optimization, not a requirement. Resume the fitted
+                  // history instead of discarding the conversation.
+                  if (
+                    error instanceof InStreamCompactionRequired &&
+                    error.fitted.fitsBudget
+                  ) {
+                    if (!silent) {
+                      log.warn(
+                        "Proactive summarization failed — resuming with the fitted history",
+                      );
+                    }
+                    await recordContextRestart(postReactiveDepth + 1, opts);
+                    const resumedFit = streamResponse({
+                      ...opts,
+                      messages: error.fitted.messages,
+                      _restartDepth: postReactiveDepth + 1,
+                      _skipProactiveSummarization: true,
+                    });
+                    for await (const chunk of resumedFit.fullStream) {
+                      yield chunk;
+                    }
+                    return;
                   }
                   if (!silent) {
                     const sumMsg =
@@ -1589,6 +1627,12 @@ export interface StreamResponseOpts {
   /** Shared only by continuations of this stream, never across agents. */
   _compaction?: { last?: CompactionLink };
   _compactionTrigger?: CompactionTrigger;
+  /**
+   * Internal: set when a proactive summarization already failed for this
+   * recovery lineage, so continuations stream the fitted history instead of
+   * immediately re-attempting the summary.
+   */
+  _skipProactiveSummarization?: boolean;
 }
 
 const NATIVE_STREAM_RECOVERY = Symbol("native-stream-recovery");
@@ -1782,8 +1826,10 @@ function streamResponseWithinOperation(
     authConfig?.customProviders,
     authConfig?.hoonifyModels,
   );
+  const skipProactiveSummarization = opts._skipProactiveSummarization === true;
   if (
     messages &&
+    !skipProactiveSummarization &&
     shouldSummarizeBeforeFitting(
       messages,
       contextWindow,
@@ -1960,6 +2006,7 @@ function streamResponseWithinOperation(
         let stepMessages = opts.messages;
         if (opts.stepNumber > 0) {
           if (
+            !skipProactiveSummarization &&
             shouldSummarizeBeforeFitting(
               stepMessages,
               contextWindow,
@@ -1971,11 +2018,14 @@ function streamResponseWithinOperation(
             )
           ) {
             messagesContainer.current = stepMessages;
+            // `fitsBudget: true` is honest here — the trigger condition
+            // requires the history to still fit, so recovery can resume
+            // these messages if the summary itself fails.
             throw new InStreamCompactionRequired({
               messages: stepMessages,
               estimatedInputTokens: estimateMessageTokens(stepMessages),
               modified: false,
-              fitsBudget: false,
+              fitsBudget: true,
             });
           }
           const fitted = fitMessagesToContext(stepMessages, {

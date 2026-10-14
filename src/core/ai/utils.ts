@@ -64,6 +64,14 @@ import { createPensarModel } from "./providers/pensar";
 const log = scopedLogger(() => createLogger("ai:utils"));
 
 /**
+ * A summary attempt completed but produced an unusable result (blank text or
+ * insufficient reduction). Recovery treats it like a context-length error —
+ * resume the fitted history or fall back to the minimal restart — instead of
+ * failing the agent turn.
+ */
+export class SummarizationRejectedError extends Error {}
+
+/**
  * Check if a model is served by a provider that speaks Anthropic's thinking
  * options — direct Anthropic, AWS Bedrock, and the Pensar gateway (which routes
  * to Bedrock). Callers pair this with a model-level capability check, since the
@@ -508,6 +516,7 @@ async function summarizeConversation(
   let usedHistory = summarizedMessages;
   let summaryResult: Awaited<ReturnType<typeof generateSummary>> | undefined;
   let lastContextError: unknown;
+  let lastAttemptTokens = estimateMessageTokens(summaryBase);
   for (const fraction of [1, 0.75, 0.5, 0.25]) {
     if (fraction < 1) {
       const fitted = fitMessagesToContext(summaryBase, {
@@ -523,7 +532,12 @@ async function summarizeConversation(
         overheadTokens: estimateToolsOverheadTokens(summaryTools) + 1_000,
         sessionPath: opts.sessionPath,
       });
-      if (!fitted.fitsBudget || !fitted.modified) continue;
+      // A best-effort reduction that misses the tighter fractional budget
+      // can still fit the provider's real window — retry whenever the
+      // history actually shrank since the last attempt.
+      if (!fitted.modified || fitted.estimatedInputTokens >= lastAttemptTokens)
+        continue;
+      lastAttemptTokens = fitted.estimatedInputTokens;
       usedHistory = [
         ...fitted.messages,
         { role: "user", content: summaryInstruction },
@@ -551,7 +565,7 @@ async function summarizeConversation(
   }
   const { text: summary } = summaryResult;
   if (!summary.trim()) {
-    throw new Error("Compaction returned no summary text");
+    throw new SummarizationRejectedError("Compaction returned no summary text");
   }
 
   // Preserve task state through summarization so the agent doesn't lose
@@ -574,7 +588,9 @@ async function summarizeConversation(
     estimateMessageTokens([{ role: "user", content: enhancedPrompt }]) >=
       estimateMessageTokens(messages) * 0.8
   ) {
-    throw new Error("Proactive compaction did not reduce context enough");
+    throw new SummarizationRejectedError(
+      "Proactive compaction did not reduce context enough",
+    );
   }
 
   compaction?.measure(
